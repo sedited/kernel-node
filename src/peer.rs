@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
     sync::{mpsc, Arc, Condvar, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bitcoin::{
@@ -34,6 +34,7 @@ use crate::{
 const PROTOCOL_VERSION: ProtocolVersion = 70015;
 const MAX_LOCATOR_HASHES: usize = 101;
 const DOWNLOAD_BATCH_SIZE: usize = 16;
+const PEER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub struct DownloadState {
@@ -468,11 +469,24 @@ pub fn process_message(
     }
 }
 
+fn stalled(state: &PeerStateMachine, last_progress: Instant) -> bool {
+    !matches!(state, PeerStateMachine::AwaitingInv) && last_progress.elapsed() > PEER_STALL_TIMEOUT
+}
+
+fn delivers_requested_block(state: &PeerStateMachine, msg: &NetworkMessage) -> bool {
+    matches!(
+        (state, msg),
+        (PeerStateMachine::AwaitingBlock(awaiting), NetworkMessage::Block(block))
+            if awaiting.peer_inventory.contains(&block.block_hash())
+    )
+}
+
 pub struct BitcoinPeer {
     dest: Destination,
     writer: Arc<ConnectionWriter>,
     reader: ConnectionReader,
     state_machine: PeerStateMachine,
+    last_progress: Instant,
 }
 
 impl fmt::Display for BitcoinPeer {
@@ -507,12 +521,17 @@ impl BitcoinPeer {
             writer: Arc::new(writer),
             reader,
             state_machine: PeerStateMachine::AwaitingHeaders,
+            last_progress: Instant::now(),
         };
         Ok(peer)
     }
 
     pub fn writer(&self) -> Arc<ConnectionWriter> {
         Arc::clone(&self.writer)
+    }
+
+    pub fn is_stalled(&self) -> bool {
+        stalled(&self.state_machine, self.last_progress)
     }
 
     pub fn release_in_flight(&self, download: &Mutex<DownloadState>) {
@@ -536,9 +555,19 @@ impl BitcoinPeer {
         node_state: &NodeState,
     ) -> Result<(), p2p::net::Error> {
         let msg = self.receive_message()?;
+        let delivered = delivers_requested_block(&self.state_machine, &msg);
         let old_state = std::mem::take(&mut self.state_machine);
         let (peer_state_machine, mut messages) = process_message(old_state, msg, node_state);
         self.state_machine = peer_state_machine;
+        let requested = messages.iter().any(|message| {
+            matches!(
+                message,
+                NetworkMessage::GetHeaders(_) | NetworkMessage::GetData(_)
+            )
+        });
+        if delivered || requested {
+            self.last_progress = Instant::now();
+        }
         for message in messages.drain(..) {
             self.writer.send_message(message)?
         }
@@ -648,6 +677,57 @@ mod tests {
             d.pop_batch(5),
             vec![hash(1), hash(2), hash(3), hash(4), hash(5)]
         );
+    }
+
+    fn long_ago() -> Instant {
+        Instant::now() - PEER_STALL_TIMEOUT - Duration::from_secs(1)
+    }
+
+    #[test]
+    fn stalled_when_awaiting_headers_past_timeout() {
+        assert!(stalled(&PeerStateMachine::AwaitingHeaders, long_ago()));
+    }
+
+    #[test]
+    fn stalled_when_awaiting_block_past_timeout() {
+        let state = PeerStateMachine::AwaitingBlock(AwaitingBlock {
+            peer_inventory: HashSet::new(),
+        });
+        assert!(stalled(&state, long_ago()));
+    }
+
+    #[test]
+    fn not_stalled_when_awaiting_inv() {
+        assert!(!stalled(&PeerStateMachine::AwaitingInv, long_ago()));
+    }
+
+    #[test]
+    fn not_stalled_with_recent_progress() {
+        assert!(!stalled(&PeerStateMachine::AwaitingHeaders, Instant::now()));
+    }
+
+    #[test]
+    fn delivered_when_block_was_requested() {
+        let blocks = block_chain(1);
+        let state = PeerStateMachine::AwaitingBlock(AwaitingBlock {
+            peer_inventory: HashSet::from([blocks[0].block_hash()]),
+        });
+        assert!(delivers_requested_block(
+            &state,
+            &NetworkMessage::Block(blocks[0].clone())
+        ));
+    }
+
+    #[test]
+    fn not_delivered_when_block_was_not_requested() {
+        let blocks = block_chain(2);
+        let state = PeerStateMachine::AwaitingBlock(AwaitingBlock {
+            peer_inventory: HashSet::from([blocks[0].block_hash()]),
+        });
+        assert!(!delivers_requested_block(
+            &state,
+            &NetworkMessage::Block(blocks[1].clone())
+        ));
     }
 
     #[test]
