@@ -173,6 +173,11 @@ impl PeerManager {
 
                     info!(target: Category::NET, "Peer thread {}: connected to {}", i, peer);
                     while running.load(Ordering::SeqCst) {
+                        if peer.is_stalled() {
+                            warn!(target: Category::NET, "Peer thread {}: stalled, disconnecting {}", i, peer);
+                            let _ = peer.writer().shutdown();
+                            break;
+                        }
                         if let Err(e) = peer.receive_and_process_message(&node_state) {
                             match e {
                                 p2p::net::Error::Io(io)
